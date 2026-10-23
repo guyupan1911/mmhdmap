@@ -4,9 +4,9 @@ from typing import Dict, List, Tuple, Union
 import torch
 from torch import Tensor
 from mmengine.model import BaseModel
+from mmdet.structures import DetDataSample, OptSampleList, SampleList
 
 from mmhdmap.utils import InstanceList, OptConfigType, OptMultiConfig
-# from mmhdmap.structures import DetDataSample, OptSampleList, SampleList
 # from ..utils import samplelist_boxtype2tensor
 
 ForwardResults = Union[Dict[str, torch.Tensor], List[DetDataSample],
@@ -15,13 +15,12 @@ ForwardResults = Union[Dict[str, torch.Tensor], List[DetDataSample],
 
 class BaseDetector(BaseModel, metaclass=ABCMeta):
 
-    
     def __init__(self,
                  data_preprocessor: OptConfigType = None,
                  init_cfg: OptMultiConfig = None):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
-    
+
     @property
     def with_neck(self) -> bool:
         """bool: whether the detector has a neck"""
@@ -50,7 +49,7 @@ class BaseDetector(BaseModel, metaclass=ABCMeta):
                 inputs: torch.Tensor,
                 data_samples: OptSampleList = None,
                 mode: str = 'tensor') -> ForwardResults:
-        
+
         if mode == 'loss':
             return self.loss(inputs, data_samples)
         elif mode == 'predict':
@@ -59,7 +58,7 @@ class BaseDetector(BaseModel, metaclass=ABCMeta):
             return self._forward(inputs, data_samples)
         else:
             raise RuntimeError(f'Invalid mode "{mode}". '
-                                'Only supports loss, predict, and tensor mode')
+                               'Only supports loss, predict, and tensor mode')
 
     @abstractmethod
     def loss(self, batch_inputs: Tensor,
@@ -70,12 +69,13 @@ class BaseDetector(BaseModel, metaclass=ABCMeta):
     def predict(self, batch_inputs: Tensor,
                 batch_data_samples: SampleList) -> SampleList:
         pass
-    
+
     @abstractmethod
-    def _forward(self, batch_inputs: Tensor,
+    def _forward(self,
+                 batch_inputs: Tensor,
                  batch_data_samples: OptSampleList = None):
         pass
-    
+
     @abstractmethod
     def extract_feat(self, batch_inputs: Tensor):
         pass

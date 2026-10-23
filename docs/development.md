@@ -1,5 +1,35 @@
 # 开发工具
 
+## 安装开发包
+
+在实际运行代码的 Python 环境中，从项目根目录执行可编辑安装：
+
+```bash
+python -m pip install -e .
+```
+
+例如在开发容器中，项目根目录是 `/workspace/mmhdmap`。安装后可从其他目录
+导入 `mmhdmap`，不需要在脚本中修改 `sys.path`。修改已有 Python 源码后，
+重新运行程序即可；修改包元信息或依赖后，应重新执行安装命令。
+
+`setup.py` 声明公共库直接使用的 MMEngine、NumPy、PyQuaternion 和 PyTorch
+依赖。请先安装与设备匹配的 PyTorch；现有开发镜像已经提供这些依赖。
+MMCV 的 CUDA 算子、MMDetection、MMDetection3D 和数据集 SDK 等实验依赖
+继续由 Docker 配置管理，安装公共包不会自动配置完整实验环境。
+
+发布包仅包含 `mmhdmap` 及其子包。`projects` 中的实验代码、配置文件及
+`tools` 脚本从源码仓库使用，不包含在 wheel 中。
+
+需要开发工具时，可以使用：
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
+这会额外安装构建工具和 pre-commit；Git hook 仍需按下文单独启用。
+`pyproject.toml` 声明 setuptools 构建后端，包信息和依赖统一维护在
+`setup.py` 中。
+
 ## 提交前自动格式化
 
 项目通过 pre-commit 调用固定版本的 YAPF，仅执行 Python 代码格式化。

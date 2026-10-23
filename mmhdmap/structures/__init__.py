@@ -1,6 +1,3 @@
-from .det_data_sample import DetDataSample, SampleList, OptSampleList
+from .map_data_sample import MapDataSample
 
-
-__all__ = [
-    'DetDataSample', 'SampleList', 'OptSampleList'
-]
+__all__ = ['MapDataSample']
