@@ -8,9 +8,9 @@ from pprint import pprint
 from mmengine.config import Config
 from mmengine.registry import init_default_scope
 
+from mmhdmap.datasets.map_utils import NuScenesMapExtractor
 from mmhdmap.registry import DATASETS, VISUALIZERS
 from mmhdmap.structures import MapDataSample
-from mmhdmap.visualization import crop_nusc_basemap
 
 
 def parse_args():
@@ -34,9 +34,9 @@ def parse_args():
         help='Visualization output directory (default: work_dirs/dataset_vis)')
     parser.add_argument(
         '--basemap-dir',
-        default='/data/nuscenes/mini/basemap',
         help='Directory containing nuScenes basemap PNGs '
-        '(default: /data/nuscenes/mini/basemap)')
+        '(default: <dataset.data_root>/basemap; empty string disables basemap)'
+    )
     parser.add_argument(
         '--map-roi-size',
         type=float,
@@ -45,6 +45,12 @@ def parse_args():
         default=(60.0, 80.0),
         help='Lateral width and longitudinal length in meters (default: 60 80)'
     )
+    parser.add_argument(
+        '--map-layers',
+        nargs='*',
+        choices=NuScenesMapExtractor.SUPPORTED_LAYERS,
+        default=list(NuScenesMapExtractor.DEFAULT_LAYERS),
+        help='Raw SDK layers to overlay; pass no values for basemap only')
     args = parser.parse_args()
     if any(not math.isfinite(size) or size <= 0 for size in args.map_roi_size):
         parser.error('--map-roi-size must contain two positive finite lengths')
@@ -55,12 +61,16 @@ def main():
     # 1. Load the config and resolve registry names in the mmhdmap scope.
     args = parse_args()
     cfg = Config.fromfile(args.config)
-    if args.basemap_dir and 'visualizer' not in cfg:
-        raise ValueError('--basemap-dir requires a visualizer in the config')
+    if 'visualizer' not in cfg:
+        raise ValueError(
+            'Map visualization requires a visualizer in the config')
     init_default_scope(cfg.get('default_scope', 'mmhdmap'))
 
     # 2. Build the selected dataset and print its basic information.
     dataset = DATASETS.build(cfg[f'{args.split}_dataset'])
+    basemap_dir = (
+        str(Path(dataset.data_root) /
+            'basemap') if args.basemap_dir is None else args.basemap_dir)
 
     print('Dataset information:')
     pprint(
@@ -111,22 +121,43 @@ def main():
         visualizer = VISUALIZERS.build(cfg.visualizer)
         visualizer.dataset_meta = dataset.metainfo
         output = Path(args.out_dir) / f'{data_sample.token}_surround.png'
+        extractor = None
         try:
-            # 7. Prepare the optional basemap outside the dataset pipeline.
+            # 7. Extract SDK basemap and raw annotations outside the pipeline.
             bev_image = None
-            if args.basemap_dir:
-                basemap_path = (
-                    Path(args.basemap_dir) / f'{data_sample.location}.png')
-                bev_image = crop_nusc_basemap(
-                    basemap_path=str(basemap_path),
-                    map_path=data_sample.map_path,
-                    ego2global=data_sample.ego2global,
-                    roi_size=tuple(args.map_roi_size))
-                print(f'\nBasemap: {basemap_path}, '
-                      f'ROI: {args.map_roi_size[0]:g} m wide x '
-                      f'{args.map_roi_size[1]:g} m long (ego-centered), '
+            map_geometries = None
+            map_resolution = None
+            map_local2global = None
+            extractor = NuScenesMapExtractor(
+                data_root=dataset.data_root,
+                map_name=data_sample.location,
+                basemap_dir=basemap_dir)
+            roi_size = tuple(args.map_roi_size)
+            if basemap_dir:
+                basemap = extractor.extract_basemap(
+                    data_sample.ego2global, roi_size=roi_size)
+                roi_size = basemap['roi_size']
+                bev_image = basemap['image']
+                map_resolution = basemap['resolution']
+                print(f'\nMap: {data_sample.location}, '
+                      f'ROI: {roi_size} m (width, length), '
                       f'crop: {bev_image.shape[1]} x {bev_image.shape[0]} px '
-                      'at native resolution')
+                      f'at {map_resolution:g} m/px')
+            # Use the pixel-rounded ROI for both raster and vector data.
+            annotations = extractor.extract_geometries(
+                data_sample.ego2global, roi_size, layers=args.map_layers)
+            map_geometries = annotations['geometries']
+            map_local2global = annotations['local2global']
+            print('Raw map geometry counts:')
+            pprint({
+                name: len(geoms)
+                for name, geoms in map_geometries.items()
+            },
+                   sort_dicts=False)
+            ground_z = data_sample.ego2global[2, 3]
+            print(f'Camera projection: horizontal ground at global '
+                  f'Z={ground_z:.3f} m; capture-time camera poses; '
+                  'no occlusion handling')
 
             # 8. Draw camera views and the basemap with the vehicle facing up.
             visualizer.add_datasample(
@@ -134,8 +165,13 @@ def main():
                 images=images,
                 data_sample=data_sample,
                 out_file=str(output),
-                bev_image=bev_image)
+                bev_image=bev_image,
+                map_geometries=map_geometries,
+                map_resolution=map_resolution,
+                map_local2global=map_local2global)
         finally:
+            if extractor is not None:
+                extractor.clear_cache()
             # Release plotting resources even if rendering or saving fails.
             visualizer.close()
         print(f'\nVisualization saved to: {output.resolve()}')

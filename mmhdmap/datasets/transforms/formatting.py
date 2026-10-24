@@ -30,12 +30,12 @@ class PackMapInputs(BaseTransform):
 
     def __init__(
         self,
-        meta_keys: Sequence[str] = ('token', 'sample_idx', 'source_sample_idx',
-                                    'scene_name', 'timestamp', 'location',
+        meta_keys: Sequence[str] = ('token', 'sample_idx', 'scene_token',
+                                    'scene_name', 'frame_idx', 'timestamp',
+                                    'prev_token', 'next_token', 'location',
                                     'camera_names', 'images', 'ori_shapes',
                                     'img_shapes', 'ego2global', 'lidar2ego',
-                                    'lidar_points', 'map_path',
-                                    'source_prev_idx', 'source_next_idx')
+                                    'lidar_points', 'map_path')
     ) -> None:
         self.meta_keys = tuple(meta_keys)
 

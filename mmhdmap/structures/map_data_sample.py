@@ -8,6 +8,10 @@ class MapDataSample(BaseDataElement):
     ``metainfo``. Input images are stored separately in the pipeline's
     ``inputs`` dict, not in this container.
 
+    For nuScenes, top-level ego2global is the reference LiDAR-time ego pose;
+    images[camera_name].ego2global is the camera capture-time ego pose.
+    Frame indices and prev/next tokens are metadata, not GT instance fields.
+
     Optional data fields:
         gt_instances (InstanceData): Vector map ground truth. Per-instance
             fields such as labels and sampled polylines share the same length.

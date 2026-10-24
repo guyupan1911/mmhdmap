@@ -1,12 +1,15 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 
 from mmhdmap.registry import VISUALIZERS
 from mmhdmap.structures import MapDataSample
+from mmhdmap.visualization.map_projection import project_map_geometries
 
 
 class TestMapLocalVisualizer(unittest.TestCase):
@@ -91,14 +94,19 @@ class TestMapLocalVisualizer(unittest.TestCase):
         expected = cv2.cvtColor(cv2.imread(str(reference)), cv2.COLOR_BGR2RGB)
         output = self.root / 'sample.png'
         self.visualizer.add_datasample(
-            'sample', self.images, sample, out_file=str(output))
+            'sample',
+            self.images,
+            sample,
+            out_file=str(output),
+            project_map=False)
         result = cv2.cvtColor(cv2.imread(str(output)), cv2.COLOR_BGR2RGB)
         np.testing.assert_array_equal(result, expected)
         self.assertEqual(sample.camera_names, self.names)
         self.assertEqual(list(sample.keys()), [])
         for original, image in zip(originals, self.images):
             np.testing.assert_array_equal(original, image)
-        self.visualizer.add_datasample('sample', self.images, sample, step=7)
+        self.visualizer.add_datasample(
+            'sample', self.images, sample, step=7, project_map=False)
         self.assertTrue(
             (self.root / 'vis_data' / 'vis_image' / 'sample_7.png').is_file())
 
@@ -119,7 +127,8 @@ class TestMapLocalVisualizer(unittest.TestCase):
             self.images,
             sample,
             out_file=str(output),
-            bev_image=basemap)
+            bev_image=basemap,
+            project_map=False)
         result = cv2.cvtColor(cv2.imread(str(output)), cv2.COLOR_BGR2RGB)
         # The 40x20 map stays at native size in the 80x144 BEV panel.
         np.testing.assert_array_equal(result[110, 312], [70, 90, 110])
@@ -134,7 +143,11 @@ class TestMapLocalVisualizer(unittest.TestCase):
         np.testing.assert_array_equal(basemap, original)
         with self.assertRaisesRegex(ValueError, 'bev_image'):
             self.visualizer.add_datasample(
-                'map', self.images, sample, bev_image=basemap.astype(float))
+                'map',
+                self.images,
+                sample,
+                bev_image=basemap.astype(float),
+                project_map=False)
 
     def test_large_bev_expands_canvas_and_preserves_pixels(self):
         sample = MapDataSample(metainfo=dict(camera_names=self.names))
@@ -146,7 +159,8 @@ class TestMapLocalVisualizer(unittest.TestCase):
             self.images,
             sample,
             out_file=str(output),
-            bev_image=basemap)
+            bev_image=basemap,
+            project_map=False)
         result = cv2.cvtColor(cv2.imread(str(output)), cv2.COLOR_BGR2RGB)
         self.assertEqual(result.shape, (236, 440, 3))
         displayed_map = result[44:224, 288:428]
@@ -169,6 +183,135 @@ class TestMapLocalVisualizer(unittest.TestCase):
             self.visualizer.add_multiview_images(
                 'sample', [image.astype(np.float32) for image in self.images],
                 self.names)
+
+    def test_sdk_geometry_overlay_holes_and_disconnected_lines(self):
+        basemap = np.zeros((80, 80, 3), dtype=np.uint8)
+        polygon = Polygon([(-15, -15), (15, -15), (15, 15), (-15, 15)],
+                          holes=[[(-5, -5), (5, -5), (5, 5), (-5, 5)]])
+        lines = MultiLineString([[(25, -15), (25, -5)], [(25, 5), (25, 15)]])
+        geometries = dict(
+            ped_crossing=[MultiPolygon([polygon])], lane_divider=[lines])
+        result = self.visualizer.draw_map_geometries(basemap, geometries, 1)
+        np.testing.assert_array_equal(result[40, 40], [0, 0, 0])
+        fill = np.rint(
+            np.array(self.visualizer.MAP_LAYER_COLORS['ped_crossing']) * 0.25)
+        np.testing.assert_array_equal(result[30, 40], fill)
+        # The two line parts are forward of the polygon with a gap at Y=0.
+        np.testing.assert_array_equal(
+            result[14, 28], self.visualizer.MAP_LAYER_COLORS['lane_divider'])
+        np.testing.assert_array_equal(result[14, 40], [0, 0, 0])
+        self.assertFalse(basemap.any())
+        self.assertEqual(len(polygon.interiors), 1)
+        sample = MapDataSample(metainfo=dict(camera_names=self.names))
+        output = self.root / 'annotated.png'
+        self.visualizer.add_datasample(
+            'map',
+            self.images,
+            sample,
+            out_file=str(output),
+            bev_image=basemap,
+            map_geometries=geometries,
+            map_resolution=1,
+            project_map=False)
+        saved = cv2.imread(str(output))
+        # Two legend rows are appended below the canvas, leaving the map size.
+        self.assertEqual(saved.shape, (260, 380, 3))
+        self.assertNotIn('gt_instances', sample)
+        with self.assertRaisesRegex(ValueError, 'map_resolution'):
+            self.visualizer.draw_map_geometries(basemap, geometries, None)
+
+    def test_capture_time_poses_share_one_ground_plane(self):
+        extrinsic = np.array(
+            [[0, -1, 0, 0], [0, 0, -1, 1.5], [1, 0, 0, 0], [0, 0, 0, 1]],
+            dtype=float)
+        intrinsic = np.array([[50, 0, 50], [0, 50, 50], [0, 0, 1]])
+        shifted_pose = np.eye(4)
+        shifted_pose[:3, 3] = [1, 0, 0.5]
+        names = ['CAM_FRONT', 'CAM_FRONT_LEFT']
+        cameras = {
+            name: dict(ego2cam=extrinsic, cam2img=intrinsic, ego2global=pose)
+            for name, pose in zip(names, [np.eye(4), shifted_pose])
+        }
+        sample = MapDataSample(
+            metainfo=dict(
+                camera_names=names, images=cameras, ego2global=np.eye(4)))
+        geometries = dict(lane_divider=[LineString([(5, -2), (5, 2)])])
+        images = [np.zeros((101, 101, 3), dtype=np.uint8) for _ in names]
+        projections = []
+
+        def record_projection(*args, **kwargs):
+            result = project_map_geometries(*args, **kwargs)
+            projections.append(result['lane_divider'])
+            return result
+
+        with patch(
+                'mmhdmap.visualization.map_local_visualizer.project_map_geometries',
+                side_effect=record_projection) as project:
+            self.visualizer.draw_projected_map(images, sample, geometries,
+                                               np.eye(3))
+        np.testing.assert_allclose(projections[0], [[[70, 65], [30, 65]]])
+        np.testing.assert_allclose(projections[1], [[[75, 75], [25, 75]]])
+        self.assertEqual(
+            [call.kwargs['ground_z'] for call in project.call_args_list],
+            [0, 0])
+        del sample.images['CAM_FRONT']['ego2global']
+        with self.assertRaisesRegex(ValueError, 'capture-time ego2global'):
+            self.visualizer.draw_projected_map(images, sample, geometries,
+                                               np.eye(3))
+
+    def test_camera_projection_uses_named_calibration_and_preserves_inputs(
+            self):
+        front = np.array(
+            [[0, -1, 0, 0], [0, 0, -1, 1], [1, 0, 0, 0], [0, 0, 0, 1]],
+            dtype=float)
+        back = front.copy()
+        back[0] *= -1
+        back[2] *= -1
+        intrinsic = np.array([[5, 0, 10], [0, 5, 5], [0, 0, 1]])
+        cameras = {
+            name:
+            dict(
+                ego2cam=front if name == 'CAM_FRONT' else back,
+                ego2global=np.eye(4),
+                cam2img=intrinsic)
+            for name in self.names
+        }
+        sample = MapDataSample(
+            metainfo=dict(
+                camera_names=self.names, images=cameras, ego2global=np.eye(4)))
+        geometries = dict(lane_divider=[LineString([(5, -3), (5, 3)])])
+        originals = [image.copy() for image in self.images]
+        result = self.visualizer.draw_projected_map(self.images, sample,
+                                                    geometries, np.eye(3))
+        for name, image, drawn in zip(self.names, self.images, result):
+            if name == 'CAM_FRONT':
+                self.assertFalse(np.array_equal(image, drawn))
+                np.testing.assert_array_equal(
+                    drawn[6, 10],
+                    self.visualizer.MAP_LAYER_COLORS['lane_divider'])
+            else:
+                np.testing.assert_array_equal(image, drawn)
+        output = self.root / 'projected.png'
+        self.visualizer.add_datasample(
+            'map',
+            self.images,
+            sample,
+            out_file=str(output),
+            map_geometries=geometries,
+            map_local2global=np.eye(3))
+        self.assertTrue(output.is_file())
+        for original, image in zip(originals, self.images):
+            np.testing.assert_array_equal(original, image)
+        np.testing.assert_array_equal(sample.images['CAM_FRONT']['ego2cam'],
+                                      front)
+        self.assertNotIn('gt_instances', sample)
+        with self.assertRaisesRegex(ValueError, 'map_local2global'):
+            self.visualizer.add_datasample(
+                'map',
+                self.images,
+                sample,
+                project_map=True,
+                map_geometries=geometries)
 
 
 if __name__ == '__main__':

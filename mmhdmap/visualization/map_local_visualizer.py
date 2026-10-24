@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
+import cv2
 import mmcv
 import numpy as np
 from mmengine.dist import master_only
@@ -8,6 +9,7 @@ from mmengine.visualization import Visualizer
 
 from mmhdmap.registry import VISUALIZERS
 from mmhdmap.structures import MapDataSample
+from .map_projection import project_map_geometries
 
 
 @VISUALIZERS.register_module()
@@ -37,6 +39,131 @@ class MapLocalVisualizer(Visualizer):
         ('CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT'),
         ('CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'),
     )
+    # RGB colors for raw nuScenes SDK layers, separate from task class labels.
+    MAP_LAYER_COLORS = {
+        'road_divider': (255, 100, 60),
+        'lane_divider': (40, 160, 255),
+        'ped_crossing': (60, 210, 100),
+        'drivable_area': (190, 150, 90),
+        'road_segment': (180, 120, 220),
+        'road_block': (240, 150, 180),
+        'lane': (80, 200, 200),
+        'walkway': (230, 200, 90),
+        'stop_line': (240, 80, 180),
+        'carpark_area': (140, 150, 230),
+    }
+
+    def draw_map_geometries(self, bev_image: np.ndarray, geometries: dict,
+                            resolution: float) -> np.ndarray:
+        """Overlay raw local-meter SDK geometry on a copy of an RGB basemap.
+
+        Local X is forward and Y left; the image is ego-centered and forward-up.
+        Multipart geometries are drawn separately and polygon holes remain
+        unfilled. Polygon clipping edges are raw ROI outlines, not boundary GT.
+        """
+        if (not isinstance(bev_image, np.ndarray)
+                or bev_image.dtype != np.uint8 or bev_image.ndim != 3
+                or bev_image.shape[2] != 3 or bev_image.size == 0):
+            raise ValueError(
+                'Map overlays require a nonempty RGB uint8 basemap')
+        if resolution is None or not np.isfinite(
+                resolution) or resolution <= 0:
+            raise ValueError('map_resolution must be a positive value in m/px')
+        unknown = set(geometries) - set(self.MAP_LAYER_COLORS)
+        if unknown:
+            raise ValueError(f'Unknown map layer colors: {sorted(unknown)}')
+        image = bev_image.copy()
+        height, width = image.shape[:2]
+
+        def pixels(coords):
+            xy = np.asarray(coords)[:, :2]
+            uv = np.column_stack(((width - 1) / 2 - xy[:, 1] / resolution,
+                                  (height - 1) / 2 - xy[:, 0] / resolution))
+            return np.rint(uv).astype(np.int32)
+
+        def draw(geometry, color):
+            if geometry.is_empty:
+                return
+            if hasattr(geometry, 'geoms'):
+                for part in geometry.geoms:
+                    draw(part, color)
+            elif geometry.geom_type == 'Polygon':
+                rings = [pixels(geometry.exterior.coords)]
+                rings.extend(
+                    pixels(ring.coords) for ring in geometry.interiors)
+                mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillPoly(mask, [rings[0]], 1)
+                if len(rings) > 1:
+                    cv2.fillPoly(mask, rings[1:], 0)
+                inside = mask.astype(bool)
+                image[inside] = np.rint(image[inside] * 0.75 +
+                                        np.asarray(color) * 0.25)
+                cv2.polylines(image, rings, True, color, 2, cv2.LINE_AA)
+            elif geometry.geom_type in ('LineString', 'LinearRing'):
+                cv2.polylines(image, [pixels(geometry.coords)], False, color,
+                              2, cv2.LINE_AA)
+            # Point intersections at the ROI boundary have no drawable length.
+
+        # Fill polygon layers first so they do not obscure divider lines.
+        layers = sorted(geometries, key=lambda name: name.endswith('divider'))
+        for name in layers:
+            for geometry in geometries[name]:
+                draw(geometry, self.MAP_LAYER_COLORS[name])
+        return image
+
+    def draw_projected_map(self,
+                           images: Sequence[np.ndarray],
+                           data_sample: MapDataSample,
+                           geometries: dict,
+                           local2global: np.ndarray,
+                           ground_height: float = 0.0) -> list:
+        """Draw map outlines on copies of calibrated, unnormalized RGB images.
+
+        The caller must supply images matching the camera intrinsics. Drawing
+        happens before display resizing. Each camera uses its capture-time
+        ego pose. All views share a horizontal ground plane at the reference
+        LiDAR-time ego elevation plus ground_height. Occlusion is not handled.
+        """
+        names = data_sample.camera_names
+        if len(images) != len(names):
+            raise ValueError('images and camera_names must have equal lengths')
+        if len(set(names)) != len(names):
+            raise ValueError('camera_names must not contain duplicates')
+        unknown = set(geometries) - set(self.MAP_LAYER_COLORS)
+        if unknown:
+            raise ValueError(f'Unknown map layer colors: {sorted(unknown)}')
+        if 'images' not in data_sample or 'ego2global' not in data_sample:
+            raise ValueError('Map projection requires images calibration and '
+                             'ego2global in data_sample')
+        ground_z = data_sample.ego2global[2, 3] + ground_height
+        outputs = []
+        for name, image in zip(names, images):
+            if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
+                    or image.ndim != 3 or image.shape[2] != 3
+                    or image.size == 0):
+                raise ValueError(
+                    f'{name}: expected a nonempty RGB uint8 image')
+            camera = data_sample.images[name]
+            if 'ego2global' not in camera:
+                raise ValueError(
+                    f'{name}: camera capture-time ego2global is required')
+            global2cam = camera['ego2cam'] @ np.linalg.inv(
+                camera['ego2global'])
+            projected = project_map_geometries(
+                geometries,
+                local2global,
+                global2cam,
+                camera['cam2img'],
+                image.shape[:2],
+                ground_z=ground_z)
+            output = image.copy()
+            for layer, segments in projected.items():
+                if len(segments):
+                    cv2.polylines(output,
+                                  np.rint(segments).astype(np.int32), False,
+                                  self.MAP_LAYER_COLORS[layer], 3, cv2.LINE_AA)
+            outputs.append(output)
+        return outputs
 
     def __init__(self,
                  name: str = 'map_visualizer',
@@ -65,10 +192,12 @@ class MapLocalVisualizer(Visualizer):
             name=name, vis_backends=vis_backends, save_dir=save_dir)
 
     def _draw_multiview_images(
-            self,
-            images: Sequence[np.ndarray],
-            camera_names: Sequence[str],
-            bev_image: Optional[np.ndarray] = None) -> np.ndarray:
+        self,
+        images: Sequence[np.ndarray],
+        camera_names: Sequence[str],
+        bev_image: Optional[np.ndarray] = None,
+        map_layers: Sequence[str] = ()
+    ) -> np.ndarray:
         """Compose RGB camera views without modifying input images."""
         expected = {name for row in self.CAMERA_LAYOUT for name in row}
         if len(images) != len(camera_names):
@@ -164,6 +293,19 @@ class MapLocalVisualizer(Visualizer):
             drawn_image[map_top:map_top + map_height, map_left:map_left +
                         map_width] = canvas[map_top:map_top + map_height,
                                             map_left:map_left + map_width]
+        if map_layers:
+            # Put the legend below the canvas, never over native map pixels.
+            legend = np.full((24 * len(map_layers) + 12, canvas.shape[1], 3),
+                             32,
+                             dtype=np.uint8)
+            for index, name in enumerate(map_layers):
+                y = 12 + index * 24
+                color = self.MAP_LAYER_COLORS[name]
+                cv2.line(legend, (map_left, y), (map_left + 24, y), color, 3)
+                cv2.putText(legend, name, (map_left + 32, y + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
+                            cv2.LINE_AA)
+            drawn_image = np.concatenate((drawn_image, legend), axis=0)
         return drawn_image
 
     @master_only
@@ -175,7 +317,12 @@ class MapLocalVisualizer(Visualizer):
                        show: bool = False,
                        wait_time: float = 0,
                        step: int = 0,
-                       bev_image: Optional[np.ndarray] = None) -> None:
+                       bev_image: Optional[np.ndarray] = None,
+                       map_geometries: Optional[dict] = None,
+                       map_resolution: Optional[float] = None,
+                       project_map: bool = True,
+                       map_local2global: Optional[np.ndarray] = None,
+                       ground_height: float = 0.0) -> None:
         """Visualize one sample using separately supplied camera images.
 
         Args:
@@ -184,8 +331,8 @@ class MapLocalVisualizer(Visualizer):
                 ``data_sample.metainfo['camera_names']``. The caller prepares
                 display images from unnormalized inputs or source files.
             data_sample (MapDataSample): Sample metadata and annotations.
-                Currently only camera names are used; map GT and prediction
-                overlays are not implemented yet.
+                Camera names, calibration and capture-time ego poses are used. Training
+                GT and prediction overlays are not implemented yet.
             out_file (str, optional): Output image path. If omitted, use the
                 configured visualization backends.
             show (bool): Whether to display the composed image.
@@ -196,11 +343,34 @@ class MapLocalVisualizer(Visualizer):
                 ratio must reflect the physical ROI. Displayed at native size
                 without resizing; the canvas expands as needed. The icon is
                 a position marker, not a drawing of the vehicle to scale.
+            map_geometries (dict, optional): Raw SDK layer geometries in local
+                meters, sharing the basemap's pose and ROI. Kept separate from
+                training GT and model predictions in ``data_sample``.
+            map_resolution (float, optional): Basemap resolution in meters per
+                pixel, required for a basemap geometry overlay.
+            project_map (bool): Also draw raw map outlines on camera images.
+                Defaults to True. Set False for camera-only or BEV-only views.
+            map_local2global (np.ndarray, optional): 3x3 planar transform from
+                the map extractor, required for camera projection.
+            ground_height (float): Assumed horizontal ground plane offset in
+                meters along global Z relative to the reference LiDAR-time ego
+                origin. Default zero
+                assumes the ground passes through that origin.
         """
         if not isinstance(data_sample, MapDataSample):
             raise TypeError('data_sample must be a MapDataSample')
         if 'camera_names' not in data_sample.metainfo:
             raise ValueError('data_sample.metainfo must contain camera_names')
+        if project_map:
+            if map_geometries is None or map_local2global is None:
+                raise ValueError('project_map requires map_geometries and '
+                                 'map_local2global')
+            images = self.draw_projected_map(
+                images,
+                data_sample,
+                map_geometries,
+                map_local2global,
+                ground_height=ground_height)
         self.add_multiview_images(
             name=name,
             images=images,
@@ -209,7 +379,9 @@ class MapLocalVisualizer(Visualizer):
             show=show,
             wait_time=wait_time,
             step=step,
-            bev_image=bev_image)
+            bev_image=bev_image,
+            map_geometries=map_geometries,
+            map_resolution=map_resolution)
 
     @master_only
     def add_multiview_images(self,
@@ -220,10 +392,18 @@ class MapLocalVisualizer(Visualizer):
                              show: bool = False,
                              wait_time: float = 0,
                              step: int = 0,
-                             bev_image: Optional[np.ndarray] = None) -> None:
+                             bev_image: Optional[np.ndarray] = None,
+                             map_geometries: Optional[dict] = None,
+                             map_resolution: Optional[float] = None) -> None:
         """Draw camera views and save to out_file or configured backends."""
-        drawn_image = self._draw_multiview_images(images, camera_names,
-                                                  bev_image)
+        if map_geometries is not None and bev_image is not None:
+            bev_image = self.draw_map_geometries(bev_image, map_geometries,
+                                                 map_resolution)
+        drawn_image = self._draw_multiview_images(
+            images,
+            camera_names,
+            bev_image,
+            map_layers=tuple(map_geometries or ()))
         self.set_image(drawn_image)
         if show:
             self.show(drawn_image, win_name=name, wait_time=wait_time)
