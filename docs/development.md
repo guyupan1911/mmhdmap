@@ -78,7 +78,7 @@ pre-commit run yapf --files mmhdmap/datasets/base_map_dataset.py
 
 ```bash
 python tools/stage1/test_nusc_map_dataset.py \
-    projects/map_tracker/configs/map_tracker_stage1.py \
+    projects/maptracker/configs/map_tracker_stage1.py \
     --out-dir work_dirs/map_projection_vis
 ```
 
