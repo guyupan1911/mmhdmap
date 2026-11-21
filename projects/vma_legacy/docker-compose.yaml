@@ -1,0 +1,37 @@
+services:
+  vma_legacy:
+    image: vma_legacy:blackwell-cu128
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        vma_source: ${VMA_REPO:-/home/guyu/projects/VMA}
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-mmhdmap-dev:latest}
+    user: "${VMA_UID:-1000}:${VMA_GID:-1000}"
+    network_mode: none
+    shm_size: 8gb
+    environment:
+      HOME: /tmp
+      MPLCONFIGDIR: /tmp/matplotlib
+    volumes:
+      - type: bind
+        source: ${VMA_REPO:-/home/guyu/projects/VMA}
+        target: /workspace/VMA
+        read_only: true
+      - ${VMA_DATA_DIR:-/home/guyu/data/vma}/sd_data:/data/sd_data:ro
+      - ${VMA_DATA_DIR:-/home/guyu/data/vma}/sd_ckpts:/data/sd_ckpts:ro
+      - ${VMA_DATA_DIR:-/home/guyu/data/vma}/nyc_ckpts:/data/nyc_ckpts:ro
+      - ./runtime:/opt/vma-support:ro
+      - ./runtime:/validation-tools:ro
+      - ${VMA_WORK_DIR:-../../work_dirs/vma_legacy}:/work_dirs
+      # Existing result JSONs contain /output paths; keep them readable.
+      - ${VMA_WORK_DIR:-../../work_dirs/vma_legacy}:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VMA_GPU:-0}"]
+              capabilities: [gpu]
+    command: [bash]
