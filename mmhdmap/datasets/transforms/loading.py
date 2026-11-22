@@ -1,8 +1,56 @@
+from copy import deepcopy
+
 import mmcv
+import numpy as np
+import torch
 from mmcv.transforms import BaseTransform
 from mmengine.fileio import get
+from mmengine.structures import InstanceData
 
 from mmhdmap.registry import TRANSFORMS
+
+
+@TRANSFORMS.register_module()
+class LoadVectorMapAnnotations(BaseTransform):
+    """Load prepared vector instances without generating model targets.
+
+    Requires ``instances`` (an empty list denotes annotated negative data).
+    Adds ``gt_instances`` with labels (int64 tensor), polylines (a list of
+    float32 [Ki, 2] arrays), and attributes (a list of copied dictionaries).
+    Coordinates retain their input frame and point order. No normalization,
+    resampling, closure or attribute encoding is performed. Omit this
+    transform from pipelines for unannotated inference images.
+    """
+
+    def transform(self, results: dict) -> dict:
+        if 'instances' not in results:
+            raise KeyError(
+                'Missing instances: unannotated data is not empty GT')
+        instances = results['instances']
+        if not isinstance(instances, list):
+            raise TypeError('instances must be a list')
+        labels, polylines, attributes = [], [], []
+        for instance in instances:
+            label = instance['label']
+            if type(label) is not int or label < 0:
+                raise ValueError('label must be a nonnegative integer')
+            points = np.array(instance['points'], dtype=np.float32, copy=True)
+            if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 2
+                    or not np.isfinite(points).all()
+                    or not np.any(np.diff(points, axis=0))):
+                raise ValueError(
+                    'points must be finite [K, 2] with nonzero length')
+            attrs = instance.get('attrs', {})
+            if not isinstance(attrs, dict):
+                raise TypeError('attrs must be a dictionary')
+            labels.append(label)
+            polylines.append(points)
+            attributes.append(deepcopy(attrs))
+        results['gt_instances'] = InstanceData(
+            labels=torch.tensor(labels, dtype=torch.long),
+            polylines=polylines,
+            attributes=attributes)
+        return results
 
 
 @TRANSFORMS.register_module()

@@ -2,7 +2,15 @@
 
 整理日期：2026-11-21。
 
-本文记录对 VMA 论文、公开代码、本地数据和 checkpoint 的检查，以及在 RDX 上训练同类模型的可行性分析。已验证事实、工程推断和待验证事项分别说明；本文不代表已经完成 RDX 数据转换、VMA 训练或精度评估。
+本文记录对 VMA 论文、公开代码、本地数据和 checkpoint 的检查，以及在 RDX 上训练同类模型的可行性分析。已验证事实、工程推断和待验证事项分别说明；原版 VMA 的 SD line 推理与微调过拟合已验证，HRDX 数据适配和训练尚未完成。
+
+迁移数据接口的设计见 [BEV 图像矢量地图数据集设计](dataset_design.md)：不同数据源通过 converter 准备固定尺寸图像和统一 infos，共用 `BevMapDataset`；VMA 训练目标由独立 transforms 生成。
+
+已实现 SD 三类数据的图像与 GT 联合裁剪，以及 train/val pickle 索引，使用方式见 [SD converter](sd_converter.md)。
+
+`BevMapDataset`、单图加载与打包已实现，配置及读取测试入口见 [projects/vma](../../projects/vma/README.md)。当前模型使用彩色图单 tensor 输入；强度图按需加载用于可视化，已验证原始 GT 加载/打包及两种底图上的 GT 绘制；训练目标生成和模型迁移尚未接入。
+
+当前数据流程、命令和实现边界统一见 [VMA 项目说明](../../projects/vma/README.md)。逆 JET、强度分布、log 映射及实例长度的讨论见 [SD 强度恢复与显示实验](intensity_recovery.md)。`test.py` 现仅用于 Dataset 初始化及可选的 Visualizer 测试。
 
 ## 1. 资料与本地路径
 
@@ -327,8 +335,42 @@ VMA 训练与图块评估
 
 ## 9. 当前结论与未完成事项
 
-已完成的工作是论文与代码调研、样例与 checkpoint 结构检查、点云颜色分析，以及两组 Jet BEV 对照图生成。
+已完成论文与代码调研、样例与 checkpoint 结构检查、点云颜色分析，以及两组 Jet BEV 对照图生成。此外，已在兼容镜像中完成原版 VMA 的 SD line checkpoint 严格加载、42 个样例图块推理、完整 checkpoint 初始化的单图块微调过拟合，以及权重保存与重载验证。
 
-尚未完成 RDX 多帧重建与 GT 叠加验证、全数据颜色一致性检查、VMA 数据转换器、checkpoint 完整加载验证或 RDX 训练评估。SD 原始着色流程和 RDX RGB 的上游来源也仍待确认。
+原版复现入口见 [projects/vma_legacy](../../projects/vma_legacy/README.md)，具体结果见 [实验记录](../../projects/vma_legacy/docs/container_validation.md)。该验证覆盖 SD line 核心训练和推理链路，尚未覆盖 box/freespace、大图合并及原分布式训练入口。重置预测头的额外实验存在点序折返，不能视为精确过拟合。
+
+尚未完成 OpenMMLab 2.0 迁移、HRDX 多帧重建与 GT 叠加验证、全数据颜色一致性检查、训练数据转换及 HRDX 训练评估。SD 原始着色流程和 RDX RGB 的上游来源也仍待确认。
 
 目前可以确认的工程方向是：沿用 VMA 的图像到矢量结构，在 RDX 上构建统一且准确对齐的 BEV 图像—GT 数据。强度单通道与伪彩色三通道都是可选输入表达；底图质量、GT 对齐与数据一致性比是否使用某种色表更基础。
+
+## 10. 下一步：迁移到 mmhdmap / OpenMMLab 2.0
+
+按“推理对齐 → 训练与过拟合 → HRDX 训练”的顺序推进，前一阶段验收通过后进入下一阶段。迁移版建议放在 `projects/vma`，保留 `projects/vma_legacy` 作为原版对照。先保持 SD line 的模型结构、预处理、匹配、损失和解码行为一致，采用 OpenMMLab 2.0 的注册、数据处理、模型接口及 MMEngine 训练流程。
+
+### 10.1 实现 inference 并测试
+
+- 迁移 image backbone/neck、Transformer、vector decoder、预测头和解码逻辑，接入 mmhdmap 的推理入口与配置。
+- 适配 SD 样例数据，核对归一化、通道顺序、图像尺度和输出坐标；加载 `/home/guyu/data/vma/sd_ckpts/sd_line.pth`。如参数名变化，提供显式映射并检查缺失项、多余项及形状，避免静默跳过权重。
+- 在相同的 42 个图块上，与 legacy 保存的类别、分数、矢量坐标及可视化逐项对照。先比较原始预测，再比较阈值过滤后的结果，区分浮点误差与行为差异。
+
+**验收：** checkpoint 完整加载、全部样例推理成功，数值差异经过量化并解释，实例数量与几何表现不存在未解释的回退；保存迁移版配置、预测和对照报告。
+
+### 10.2 实现 train 并测试 overfitting
+
+- 迁移 Dataset/Transforms、数据封装、GT 点序生成、Hungarian 匹配与损失，接入 MMEngine Runner、优化器和学习率调度。
+- 先用完整 SD checkpoint 初始化，在 `sample_4_5.jpg` 上复现单图块过拟合：300 步、初始学习率 `2e-5`，关闭 GridMask/dropout，使用与 legacy 一致的其余训练设置。
+- 对照各项损失、梯度、预测数量和几何误差，并检查点序、反向折返及折线长度，避免仅凭 Chamfer 或实例数量判断成功。
+- 保存训练 checkpoint，独立重载后再次推理，并验证训练状态的保存与恢复。
+
+**验收：** 训练全过程损失和梯度有限，7 个 GT 能被准确拟合，几何误差达到与 legacy 约 `0.066 px` 同等量级且无异常折返；重载预测一致，训练可恢复。重置预测头实验不作为本阶段的必要条件。
+
+### 10.3 在 HRDX 数据中训练
+
+- 核对点云、定位轨迹和人工 GT 的坐标关系；明确 RGB 的使用方式，生成尺度统一的 BEV 底图，完成裁块、GT 裁剪及类别/属性转换。缺失的属性不沿用虚构标签。
+- 按地理区域或路线划分训练、验证和测试集，再生成图块，防止重叠区域泄漏。先可视化检查图像与 GT 对齐，并在少量图块上过拟合，再开展正式训练。
+- 根据 HRDX 的类别与属性定义决定 SD 权重的复用范围；对形状不兼容的预测分支显式重新初始化并记录。保存训练配置、数据版本、初始化方式、指标和可视化。
+- HRDX 航拍图可作为另一种输入单独训练同结构模型；使用一致的区域划分和评估规则，比较 BEV 与航拍输入。分别训练成功不等于同一套权重已经具备跨输入泛化能力。
+
+**验收：** 数据转换及对齐检查通过，少量样本能够过拟合，完整训练可运行，并在独立验证集上给出类别、几何和点序评估。涉及大图输出时，另验证图块合并与全局坐标恢复。
+
+原始数据与 checkpoint 保留在 `/home/guyu/data/vma`；迁移实验结果建议保存到 `mmhdmap/work_dirs/vma`，与 `work_dirs/vma_legacy` 的对照结果分开。

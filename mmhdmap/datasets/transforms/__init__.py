@@ -1,4 +1,7 @@
-from .formatting import PackMapInputs
-from .loading import LoadMultiViewImagesFromFiles
+from .formatting import PackBEVMapInputs, PackMapInputs
+from .loading import LoadMultiViewImagesFromFiles, LoadVectorMapAnnotations
 
-__all__ = ['LoadMultiViewImagesFromFiles', 'PackMapInputs']
+__all__ = [
+    'LoadMultiViewImagesFromFiles', 'PackMapInputs', 'PackBEVMapInputs',
+    'LoadVectorMapAnnotations'
+]

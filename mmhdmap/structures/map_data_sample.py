@@ -6,7 +6,10 @@ class MapDataSample(BaseDataElement):
 
     Camera names, calibration, poses and sample identifiers belong to
     ``metainfo``. Input images are stored separately in the pipeline's
-    ``inputs`` dict, not in this container.
+    ``inputs`` (a single-image tensor or multi-view dict), not in this
+    container. For prepared BEV images, metadata includes sample_id,
+    ori_shape, img_shape and optional source_id/crop_origin. Unannotated
+    images leave gt_instances absent.
 
     For nuScenes, top-level ego2global is the reference LiDAR-time ego pose;
     images[camera_name].ego2global is the camera capture-time ego pose.
@@ -14,7 +17,9 @@ class MapDataSample(BaseDataElement):
 
     Optional data fields:
         gt_instances (InstanceData): Vector map ground truth. Per-instance
-            fields such as labels and sampled polylines share the same length.
+            labels (int64 tensor), polylines (variable-length float32 arrays),
+            and attributes (raw dictionaries) share the same instance count.
+            Model transforms may additionally attach encoded training targets.
         pred_instances (InstanceData): Predicted map instances and scores.
         gt_sem_seg (PixelData): BEV semantic ground truth, e.g. a ``sem_seg``
             tensor with shape (C, H, W) for per-class binary masks.

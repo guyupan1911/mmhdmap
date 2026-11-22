@@ -66,3 +66,45 @@ class PackMapInputs(BaseTransform):
                 setattr(data_sample, key, results[key])
 
         return dict(inputs=dict(imgs=tensors), data_samples=data_sample)
+
+
+@TRANSFORMS.register_module()
+class PackBEVMapInputs(BaseTransform):
+    """Pack a single HWC image, preserving pixel values and channel order.
+
+    Returns inputs as a contiguous CHW tensor and data_samples as a
+    MapDataSample. MMCV LoadImageFromFile supplies BGR; color conversion and
+    normalization belong to the data preprocessor (or visualization caller).
+    Optional gt_instances/gt_sem_seg from earlier transforms are attached;
+    unannotated samples leave these fields absent.
+    Optional intensity paths are metadata for on-demand visualization;
+    intensity pixels are neither loaded nor packed into model inputs.
+    """
+
+    def __init__(
+        self,
+        meta_keys: Sequence[str] = ('sample_id', 'sample_idx', 'img_path',
+                                    'ori_shape', 'img_shape', 'source_id',
+                                    'crop_origin', 'source_img_path',
+                                    'trajectory_path', 'trajectory_index',
+                                    'trajectory_sample_index',
+                                    'intensity_img_path',
+                                    'source_intensity_img_path')
+    ) -> None:
+        self.meta_keys = tuple(meta_keys)
+
+    def transform(self, results: dict) -> dict:
+        image = results['img']
+        if (not isinstance(image, np.ndarray) or image.ndim != 3
+                or image.shape[2] != 3 or image.size == 0):
+            raise ValueError('img must be a nonempty HWC three-channel array')
+        inputs = torch.from_numpy(
+            np.ascontiguousarray(image.transpose(2, 0, 1)))
+        data_sample = MapDataSample(metainfo={
+            key: results[key]
+            for key in self.meta_keys if key in results
+        })
+        for key in ('gt_instances', 'gt_sem_seg'):
+            if key in results:
+                setattr(data_sample, key, results[key])
+        return dict(inputs=inputs, data_samples=data_sample)
